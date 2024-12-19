@@ -1,0 +1,257 @@
+import base64
+import functions_framework
+import time
+import requests
+import gzip
+import json
+import gspread
+import random
+import pandas as pd
+from pytz import timezone
+from typing import List
+from pprint import pprint
+from datetime import datetime, timedelta
+from dateutil.relativedelta import relativedelta 
+
+CLIENT_ID = xxx
+CLIENT_SECRET = xxx
+REFRESH_TOKEN = xxx
+PROFILE_ID = xxx
+
+def get_access_token() -> str:
+    url = 'https://api.amazon.com/auth/o2/token'
+    from_data = {
+        'grant_type': 'refresh_token',
+        'refresh_token': REFRESH_TOKEN,
+        'client_id': CLIENT_ID,
+        'client_secret': CLIENT_SECRET
+    }
+
+    try:
+        response = requests.post(url, data=from_data)
+        print(f"Access Token Response Status Code: {response.status_code}")
+        
+        if response.status_code == 200:
+            access_tokens = response.json()
+            print("Access token retrieved successfully.")
+            return access_tokens['access_token']
+        else:
+            print(f"Failed to get access token. Response: {response.text}")
+            raise Exception("Failed to retrieve access token. Please check the credentials or refresh token.")
+    
+    except Exception as e:
+        print(f"Error during access token retrieval: {str(e)}")
+        raise
+
+
+def get_profile_id(access_token: str) -> None:
+    url = "https://advertising-api.amazon.com/v2/profiles"
+    headers = {
+        'Authorization': f'Bearer {access_token}',
+        'Amazon-Advertising-API-ClientId': CLIENT_ID
+    }
+    response = requests.get(url, headers=headers)
+    pprint(response.text)
+
+def get_report_url_once_its_ready(access_token: str, profile_id: str, report_id: str) -> str:
+    url = f"https://advertising-api.amazon.com/reporting/reports/{report_id}"
+    headers = {
+        "Amazon-Advertising-API-ClientId": CLIENT_ID,
+        "Amazon-Advertising-API-Scope": profile_id,
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json"
+    }
+    report_url = None
+    max_retries = 20
+    retry_count=0
+
+    while report_url is None and retry_count < max_retries:
+        response = requests.get(url, headers=headers)
+        print(f"Attempt {retry_count+1} to fetch report URL.")
+        if response.status_code == 200:
+            response_json = response.json()
+            status = response_json.get('status')
+            report_url = response_json.get('url')
+            print(f"Report Status: {status}")
+
+            if report_url:
+                print(f"Report URL: {report_url}")
+                return report_url
+            elif status in ['PROCESSING', 'PENDING']:
+                print("Report is still processing, retrying in 3 minutes...")
+                retry_count += 1
+                time.sleep(180)  # Wait for 3 minutes
+            elif status == 'FAILURE':
+                print("Report generation failed.")
+                break
+            else:
+                print(f"Unexpected report status: {status}")
+                break
+        else:
+            print(f"Error fetching report URL. Status Code: {response.status_code}, Content: {response.content}")
+            retry_count += 1
+            time.sleep(random.randint(120, 180))  # Random wait to avoid rate limit issues
+    if not report_url:
+        print("Failed to retrieve the report URL after maximum retries.")
+    return report_url
+
+def get_report_data(access_token: str, profile_id: str, start_date: str, end_date: str) -> List[dict]:
+    url = "https://advertising-api.amazon.com/reporting/reports"
+    report_name = f"Amazon Campaign Revenue Report {datetime.now().strftime('%Y%m%d%H%M%S')}_{random.randint(1000, 9999)}"
+
+
+    request_body = {
+        "name": report_name,
+        "startDate": start_date,
+        "endDate": end_date,
+        "configuration": {
+            "adProduct": "SPONSORED_PRODUCTS",
+            "groupBy": ["adGroup"],
+            "reportTypeId": "spCampaigns",
+            "timeUnit": "DAILY",
+            "columns": ["date", "sales30d"],
+            "format": "GZIP_JSON"
+        }
+    }
+    headers = {
+        "Amazon-Advertising-API-ClientId": CLIENT_ID,
+        "Amazon-Advertising-API-Scope": profile_id,
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json"
+    }
+
+    try:
+        response = requests.post(url, headers=headers, json=request_body)
+        print(f"Report Request Status Code: {response.status_code}")
+
+        # Handle common errors related to token or permissions
+        if response.status_code == 200:
+            response_json = response.json()
+            report_id = response_json.get('reportId')
+            print(f"Report ID: {report_id}")
+            if report_id:
+                report_url = get_report_url_once_its_ready(access_token, profile_id, report_id)
+                if report_url:
+                    r = requests.get(report_url)
+                    bytes_response = gzip.decompress(r.content)
+                    json_str = bytes_response.decode('utf-8')
+                    report_data = json.loads(json_str)
+                    return report_data
+            else:
+                print("Failed to create report.")
+                return []
+        elif response.status_code == 401:
+            print("Error: Unauthorized. Please check your access token or refresh token.")
+            raise Exception("401 Unauthorized: Token issue or credentials expired.")
+        elif response.status_code == 403:
+            print("Error: Forbidden. The access token might not have the right permissions.")
+            raise Exception("403 Forbidden: Permissions issue.")
+        elif response.status_code == 425:
+            # Handle duplicate report request
+            print("Duplicate report request detected.")
+            existing_report_id = response.json().get('detail').split(":")[-1].strip()
+            print(f"Duplicate report ID: {existing_report_id}")
+            report_url = get_report_url_once_its_ready(access_token, profile_id, existing_report_id)
+            if report_url:
+                r = requests.get(report_url)
+                bytes_response = gzip.decompress(r.content)
+                json_str = bytes_response.decode('utf-8')
+                report_data = json.loads(json_str)
+                return report_data
+            else:
+                print("Failed to retrieve duplicate report.")
+                return []
+        else:
+            print(f"Error creating report. Status code: {response.status_code}, Response: {response.text}")
+            return []
+
+    except Exception as e:
+        print(f"Error in report data retrieval: {str(e)}")
+        return []
+
+def put_data_to_gs(ads_data: List[dict]) -> None:
+    SHEET_NAME = "Curist // Global ROAS"
+    WORKSHEET_NAME = "Cruist_amazon"
+    HEADER = ["Date", "Total Sales"]
+
+    try:
+        gc = gspread.service_account(filename='service_account.json')
+        sh = gc.open(SHEET_NAME)
+    except Exception as e:
+        print(f"Error opening Google Sheet '{SHEET_NAME}': {e}")
+        return
+
+    try:
+        worksheet = sh.worksheet(WORKSHEET_NAME)
+    except gspread.exceptions.WorksheetNotFound:
+        print(f"Worksheet '{WORKSHEET_NAME}' not found. Creating a new one.")
+        try:
+            worksheet = sh.add_worksheet(title=WORKSHEET_NAME, rows="100", cols="2")
+        except Exception as e:
+            print(f"Error creating worksheet: {e}")
+            return
+
+    if ads_data:
+        df = pd.DataFrame(ads_data)
+        df['date'] = pd.to_datetime(df['date'])
+        daily_data = df.groupby('date').agg({'sales30d': 'sum'}).reset_index()
+
+        formatted_data = [
+            [row['date'].strftime('%Y-%m-%d'), row['sales30d']]
+            for _, row in daily_data.iterrows()
+        ]
+
+        data = worksheet.get_all_values()
+        if not data or data[0] != HEADER:
+            print(f"Inserting headers: {HEADER}")
+            try:
+                worksheet.insert_row(HEADER, 1)
+            except Exception as e:
+                print(f"Error inserting headers: {e}")
+                return
+
+        if formatted_data:
+            print(f"Formatted data to insert: {formatted_data}")
+            try:
+                worksheet.insert_rows(formatted_data, 2)
+            except Exception as e:
+                print(f"Error inserting data: {e}")
+        else:
+            print("No formatted data to write to Google Sheets.")
+    else:
+        print("No ads_data available for Google Sheets insertion.")
+
+
+
+def script():
+    print("Getting access token...\n")
+    access_token = get_access_token()
+    if not access_token:
+        return
+
+     # Set the desired timezone
+    america_tz = timezone('America/New_York')
+
+    # Get the current date in the specified timezone
+    current_time = datetime.now(america_tz)
+    end_date = current_time.strftime('%Y-%m-%d')
+
+    # Calculate the start date in the specified timezone
+    start_date = (current_time - timedelta(days=21)).strftime('%Y-%m-%d')
+
+    print(f"Fetching data from {start_date} to {end_date}")
+
+
+
+    report_data = get_report_data(access_token, PROFILE_ID, start_date, end_date)
+    print("Last Week's Report Data:")
+    pprint(report_data)
+
+    put_data_to_gs(report_data)
+
+# Triggered from a message on a Cloud Pub/Sub topic.
+@functions_framework.cloud_event
+def hello_pubsub(cloud_event):
+    # Print out the data from Pub/Sub, to prove that it worked
+    print(base64.b64decode(cloud_event.data["message"]["data"]))
+    script()
